@@ -10,6 +10,9 @@ int main() {
         std::cout << "GLFW is not init\n";
         return -1;
     }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     window = glfwCreateWindow(1024, 720, "FractalGPU", NULL, NULL);
     if (!window) {
         std::cout << "Window creation failed\n";

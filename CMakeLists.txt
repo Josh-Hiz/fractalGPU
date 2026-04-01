@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10.0)
+cmake_minimum_required(VERSION 3.22.0)
 
 project(FractalGPU VERSION 1.0.0)
 
