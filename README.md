@@ -30,3 +30,19 @@ cmake -B build -G Ninja
 ninja
 ./FractalGPU
 ```
+
+## CPU Results (Graphically)
+
+Here are the results of our CPU ray-marcher, real-time statistics and performance will be provided in a comprehensive report once CUDA and statistics gather functionality are fully implemented.
+
+### Mandelbulb Render
+
+![bulb](./assets/cpu_mandelbulb.png)
+
+### Mandelbox Render
+
+![bulb](./assets/cpu_mandelbox.png)
+
+### Julia Set Quaternion Render
+
+![bulb](./assets/cpu_julia.png)
