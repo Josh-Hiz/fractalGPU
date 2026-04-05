@@ -10,7 +10,7 @@
             "name": "base",
             "hidden": true,
             "generator": "Ninja",
-            "binaryDir": "${sourceDir}/build/${presetName}",
+            "binaryDir": "${sourceDir}/build",
             "cacheVariables": {
                 "CMAKE_CXX_STANDARD": "20",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
@@ -19,7 +19,6 @@
         {
             "name": "cpu-debug",
             "displayName": "CPU Debug",
-            "description": "CPU renderer, debug symbols, no optimisation",
             "inherits": "base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
@@ -29,7 +28,6 @@
         {
             "name": "cpu-release",
             "displayName": "CPU Release",
-            "description": "CPU renderer, fully optimised",
             "inherits": "base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",

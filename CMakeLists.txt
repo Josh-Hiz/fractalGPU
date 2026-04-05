@@ -4,35 +4,35 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(imgui STATIC
-    external/imgui/imgui.cpp
-    external/imgui/imgui_demo.cpp
-    external/imgui/imgui_draw.cpp
-    external/imgui/imgui_tables.cpp
-    external/imgui/imgui_widgets.cpp
-    external/imgui/backends/imgui_impl_glfw.cpp
-    external/imgui/backends/imgui_impl_opengl3.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_demo.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_draw.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_tables.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_widgets.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/backends/imgui_impl_glfw.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/backends/imgui_impl_opengl3.cpp
 )
 target_include_directories(imgui PUBLIC
-    external/imgui
-    external/imgui/backends
-    external/glad/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/backends
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/glad/include
 )
 target_compile_definitions(imgui PUBLIC IMGUI_IMPL_OPENGL_LOADER_GLAD)
 find_package(glfw3 REQUIRED)
 target_link_libraries(imgui PUBLIC glfw)
 
 add_executable(FractalGPU
-    src/main.cpp
-    src/renderer_cpu.cpp
-    external/glad/src/glad.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/renderer_cpu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/glad/src/glad.c
 )
 
 set(OpenGL_GL_PREFERENCE "GLVND")
 find_package(OpenGL REQUIRED)
 
 target_include_directories(FractalGPU PRIVATE
-    external/glad/include
-    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/glad/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_link_libraries(FractalGPU PRIVATE
