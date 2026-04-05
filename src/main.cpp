@@ -3,7 +3,6 @@
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -16,9 +15,7 @@
 #include "renderer_cpu.hpp"
 #include "shaders.hpp"
 
-// ─── GL helpers
-// ───────────────────────────────────────────────────────────────
-
+// GL helpers
 static GLuint compileShader(GLenum type, const char *src) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
@@ -45,10 +42,9 @@ static GLuint createProgram(const char *vert, const char *frag) {
     return p;
 }
 
-// ─── orbit camera
-// ───────────────────────────────────────────────────────────── Spherical
+// orbit camera
+//  Spherical
 // coords (dist, azimuth, elevation) → Cartesian camera position
-
 struct OrbitCamera {
     float dist = 3.0f;
     float azimuth = 0.0f;
@@ -65,9 +61,7 @@ struct OrbitCamera {
     }
 };
 
-// ─── app state
-// ────────────────────────────────────────────────────────────────
-
+// app state
 struct App {
     OrbitCamera orbit;
     RenderParams params;
@@ -81,9 +75,7 @@ struct App {
 
 static App g;
 
-// ─── GLFW callbacks
-// ───────────────────────────────────────────────────────────
-
+// GLFW callbacks
 static void onMouseBtn(GLFWwindow *win, int btn, int action, int) {
     if (ImGui::GetIO().WantCaptureMouse)
         return;
@@ -117,9 +109,7 @@ static void onScroll(GLFWwindow *, double, double dy) {
     g.dirty = true;
 }
 
-// ─── ImGui style
-// ──────────────────────────────────────────────────────────────
-
+// ImGui
 static void applyStyle() {
     ImGuiStyle &s = ImGui::GetStyle();
     s.WindowRounding = 8.0f;
@@ -158,9 +148,7 @@ static void applyStyle() {
     c[ImGuiCol_ScrollbarGrab] = {0.28f, 0.14f, 0.58f, 1.00f};
 }
 
-// ─── presets
-// ──────────────────────────────────────────────────────────────────
-
+// presets
 static void presetMandelbulb(float power, int iter, float dist, glm::vec3 palA,
                              glm::vec3 palB) {
     g.params.fractalType = FractalType::Mandelbulb;
@@ -197,9 +185,7 @@ static void presetJulia(glm::vec4 c, int iter, float dist, glm::vec3 palA,
     g.dirty = true;
 }
 
-// ─── UI
-// ───────────────────────────────────────────────────────────────────────
-
+// UI
 static void drawUI() {
     ImGui::SetNextWindowPos({10.0f, 10.0f}, ImGuiCond_Always);
     ImGui::SetNextWindowSize({290.0f, 0.0f}, ImGuiCond_Always);
@@ -210,8 +196,7 @@ static void drawUI() {
 
     bool changed = false;
 
-    // ── fractal type
-    // ──────────────────────────────────────────────────────────
+    // fractal type
     ImGui::SeparatorText("Fractal");
     const char *types[] = {"Mandelbulb", "Mandelbox", "Julia (quaternion)"};
     int ft = (int)g.params.fractalType;
@@ -326,8 +311,7 @@ static void drawUI() {
     if (ImGui::SliderFloat("Epsilon", &g.params.epsilon, 0.0001f, 0.005f))
         changed = true;
 
-    // ── lighting
-    // ──────────────────────────────────────────────────────────────
+    // lighting
     if (ImGui::CollapsingHeader("Lighting")) {
         auto &l = g.params.light;
         if (ImGui::SliderFloat("Light X", &l.direction.x, -1.0f, 1.0f))
@@ -360,8 +344,7 @@ static void drawUI() {
         }
     }
 
-    // ── color
-    // ─────────────────────────────────────────────────────────────────
+    // color
     if (ImGui::CollapsingHeader("Color")) {
         auto &col = g.params.color;
         if (ImGui::ColorEdit3("Palette A", glm::value_ptr(col.paletteA)))
@@ -382,8 +365,7 @@ static void drawUI() {
             changed = true;
     }
 
-    // ── camera
-    // ────────────────────────────────────────────────────────────────
+    // camera
     if (ImGui::CollapsingHeader("Camera")) {
         bool cc = false;
         if (ImGui::SliderFloat("Distance", &g.orbit.dist, 0.3f, 30.0f))
@@ -407,8 +389,7 @@ static void drawUI() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── render button + stats
-    // ─────────────────────────────────────────────────
+    // render button + stats
     if (ImGui::Button("Render now", {-1.0f, 30.0f}))
         g.dirty = true;
 
@@ -424,8 +405,7 @@ static void drawUI() {
         g.dirty = true;
 }
 
-// ─── main ────────────────────────────────────────────────────────────────────
-
+//  main
 int main() {
     if (!glfwInit()) {
         std::cerr << "GLFW init failed\n";

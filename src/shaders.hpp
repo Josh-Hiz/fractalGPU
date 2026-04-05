@@ -1,7 +1,7 @@
 #pragma once
 
 // Fullscreen quad — just passes UV through
-static const char* QUAD_VERT = R"glsl(
+static const char *QUAD_VERT = R"glsl(
 #version 330 core
 layout(location = 0) in vec2 aPos;
 layout(location = 1) in vec2 aUV;
@@ -13,7 +13,7 @@ void main() {
 )glsl";
 
 // Displays the CPU-rendered texture with ACES tone mapping + gamma correction
-static const char* QUAD_FRAG = R"glsl(
+static const char *QUAD_FRAG = R"glsl(
 #version 330 core
 in vec2 uv;
 out vec4 FragColor;
