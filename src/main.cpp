@@ -14,6 +14,9 @@
 #include "config.hpp"
 #include "renderer_cpu.hpp"
 #include "shaders.hpp"
+#ifdef FRACTAL_USE_CUDA
+#include "renderer_gpu.hpp"
+#endif
 
 // GL helpers
 static GLuint compileShader(GLenum type, const char *src) {
@@ -65,7 +68,13 @@ struct OrbitCamera {
 struct App {
     OrbitCamera orbit;
     RenderParams params;
-    CPURenderer renderer;
+    CPURenderer cpuRenderer;
+#ifdef FRACTAL_USE_CUDA
+    GPURenderer gpuRenderer;
+    bool useGPU = true;
+#else
+    bool useGPU = false;
+#endif
     GLuint tex = 0;
     bool dirty = true;
     bool dragging = false;
@@ -389,14 +398,49 @@ static void drawUI() {
     ImGui::Separator();
     ImGui::Spacing();
 
+#ifdef FRACTAL_USE_CUDA
+    ImGui::SeparatorText("Backend");
+    bool gpuToggle = g.useGPU;
+    if (ImGui::RadioButton("CPU", !gpuToggle)) {
+        g.useGPU = false;
+        g.dirty = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("GPU (CUDA)", gpuToggle)) {
+        g.useGPU = true;
+        g.dirty = true;
+    }
+    ImGui::Spacing();
+#endif
+
     // render button + stats
     if (ImGui::Button("Render now", {-1.0f, 30.0f}))
         g.dirty = true;
 
     ImGui::Spacing();
-    ImGui::TextDisabled("Render time : %.1f ms", g.renderer.renderMs());
-    ImGui::TextDisabled("Resolution  : %d x %d", g.renderer.renderWidth(),
-                        g.renderer.renderHeight());
+    double ms = g.useGPU
+#ifdef FRACTAL_USE_CUDA
+                    ? g.gpuRenderer.renderMs()
+#else
+                    ? 0.0
+#endif
+                    : g.cpuRenderer.renderMs();
+    int rw = g.useGPU
+#ifdef FRACTAL_USE_CUDA
+                 ? g.gpuRenderer.renderWidth()
+#else
+                 ? 0
+#endif
+                 : g.cpuRenderer.renderWidth();
+    int rh = g.useGPU
+#ifdef FRACTAL_USE_CUDA
+                 ? g.gpuRenderer.renderHeight()
+#else
+                 ? 0
+#endif
+                 : g.cpuRenderer.renderHeight();
+    ImGui::TextDisabled("Render time : %.1f ms", ms);
+    ImGui::TextDisabled("Resolution  : %d x %d", rw, rh);
     ImGui::TextDisabled("Left-drag: orbit   Scroll: zoom");
 
     ImGui::End();
@@ -478,13 +522,26 @@ int main() {
         glfwGetFramebufferSize(win, &winW, &winH);
         glViewport(0, 0, winW, winH);
 
-        // CPU render → upload to texture
+        // Render → upload to texture
         if (g.dirty) {
-            g.renderer.render(winW, winH, g.params);
-            glBindTexture(GL_TEXTURE_2D, g.tex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, g.renderer.renderWidth(),
-                         g.renderer.renderHeight(), 0, GL_RGB, GL_FLOAT,
-                         g.renderer.pixels().data());
+#ifdef FRACTAL_USE_CUDA
+            if (g.useGPU) {
+                g.gpuRenderer.render(winW, winH, g.params);
+                glBindTexture(GL_TEXTURE_2D, g.tex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                             g.gpuRenderer.renderWidth(),
+                             g.gpuRenderer.renderHeight(), 0, GL_RGB, GL_FLOAT,
+                             g.gpuRenderer.pixels().data());
+            } else
+#endif
+            {
+                g.cpuRenderer.render(winW, winH, g.params);
+                glBindTexture(GL_TEXTURE_2D, g.tex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                             g.cpuRenderer.renderWidth(),
+                             g.cpuRenderer.renderHeight(), 0, GL_RGB, GL_FLOAT,
+                             g.cpuRenderer.pixels().data());
+            }
             g.dirty = false;
         }
 
