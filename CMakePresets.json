@@ -33,6 +33,28 @@
                 "CMAKE_BUILD_TYPE": "Release",
                 "FRACTAL_ENABLE_CUDA": "OFF"
             }
+        },
+        {
+            "name": "gpu-debug",
+            "displayName": "GPU Debug (CUDA)",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "FRACTAL_ENABLE_CUDA": "ON",
+                "CMAKE_CUDA_COMPILER": "/usr/local/cuda-13/bin/nvcc",
+                "CUDAToolkit_ROOT": "/usr/local/cuda-13"
+            }
+        },
+        {
+            "name": "gpu-release",
+            "displayName": "GPU Release (CUDA)",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "FRACTAL_ENABLE_CUDA": "ON",
+                "CMAKE_CUDA_COMPILER": "/usr/local/cuda-13/bin/nvcc",
+                "CUDAToolkit_ROOT": "/usr/local/cuda-13"
+            }
         }
     ],
     "buildPresets": [
@@ -43,6 +65,14 @@
         {
             "name": "cpu-release",
             "configurePreset": "cpu-release"
+        },
+        {
+            "name": "gpu-debug",
+            "configurePreset": "gpu-debug"
+        },
+        {
+            "name": "gpu-release",
+            "configurePreset": "gpu-release"
         }
     ]
 }
