@@ -47,7 +47,7 @@ Moving on, go [download the toolkit for your architecture.](https://developer.nv
 
 [This guide may also be useful.](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
 
-After in
+After installing CUDA toolkit, you should be able to compile the exact same way, but there are compiler flags that can be set, checkout the `CMakePresets.json` file for the flags used for CUDA compilation.
 
 ## Results
 
