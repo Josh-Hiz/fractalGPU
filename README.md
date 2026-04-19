@@ -56,8 +56,9 @@ Our testing results and reports can be found in the `Reports/` folder of this re
 Below is the initial results from our initial CUDA version:
 
 | Fractal            | CPU (ms/frame) average | GPU (ms/frame) average | Speedup |
+|--------------------|------------------------|------------------------|---------|
 | Mandelbulb         | 1315.3                 | 0.4                    | ~3288x  |
-| Mandelbox.         | 4669.7                 | 0.9                    | ~5188   |
+| Mandelbox          | 4669.7                 | 0.9                    | ~5188   |
 | Julia (quaternion) | 811.9                  | 0.3                    | ~2706   |
 
 NVIDIA CUDA Profiling Tooling Interface (CUPTI) results and final report on our research and development to be posted soon. This report will include results for volumetric rendering as well.
