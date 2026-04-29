@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <vector>
@@ -343,17 +344,149 @@ __device__ static glm::vec3 shadePixel(int px, int py, int width, int height,
 }
 
 // ---------------------------------------------------------------------------
-// Kernel
+// Volumetric ray marcher
+//
+// Samples the SDF uniformly along the ray, stores (density, trap) per sample
+// in shared memory, then composites front-to-back using Beer-Lambert.  Each
+// thread owns its own SMEM slice (no cross-thread sync needed) - the SMEM
+// keeps register pressure low and decouples the sample/composite phases.
+//
+// Samples are concentrated inside the fractal's bounding sphere (so the same
+// step budget gets ~5x finer resolution on the structure) and a per-pixel
+// jitter dithers the sampling pattern to hide the slab boundaries that would
+// otherwise alias as "phasing" edges when the camera rotates.
 // ---------------------------------------------------------------------------
 
-__global__ static void renderKernel(float *pixels, int width, int height,
-                                     RenderParams params) {
+#define MAX_VOL_STEPS 32
+
+// Ray vs sphere centered at origin.  Returns false on miss.
+__device__ static bool intersectSphere(const DevRay &ray, float radius,
+                                        float &tNear, float &tFar) {
+    float b = glm::dot(ray.origin, ray.dir);
+    float c = glm::dot(ray.origin, ray.origin) - radius * radius;
+    float h = b * b - c;
+    if (h < 0.0f)
+        return false;
+    h = sqrtf(h);
+    tNear = -b - h;
+    tFar  = -b + h;
+    return true;
+}
+
+// Stable per-pixel hash in [0, 1) — used to jitter the sample offset.
+__device__ static float pixelHash(int px, int py) {
+    unsigned int h = ((unsigned int)px * 73856093u) ^ ((unsigned int)py * 19349663u);
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return (float)(h & 0xFFFFFFu) / (float)0x1000000u;
+}
+
+__device__ static glm::vec3 marchVolumetric(const DevRay &ray,
+                                             const RenderParams &p,
+                                             float2 *s_samples, int tid,
+                                             int px, int py) {
+    const int steps = min(p.vol.steps, MAX_VOL_STEPS);
+
+    // Sky background — used both on miss and as the residual transmittance fill.
+    float fade = 0.5f * (ray.dir.y + 1.0f);
+    glm::vec3 bg = d_mixv(p.color.bgBottom, p.color.bgTop, fade);
+
+    // Concentrate samples inside the fractal's bounding sphere.
+    float tNear, tFar;
+    if (!intersectSphere(ray, p.vol.bound, tNear, tFar))
+        return bg;
+    tNear = fmaxf(tNear, 0.001f);
+    tFar  = fminf(tFar, p.maxDist);
+    if (tFar <= tNear)
+        return bg;
+
+    const float stepSize = (tFar - tNear) / (float)steps;
+    const float jitter   = pixelHash(px, py);
+
+    // Phase 1: sample SDF along ray, write (density, trap) into SMEM.
+    for (int i = 0; i < steps; ++i) {
+        float t = tNear + ((float)i + jitter) * stepSize;
+        glm::vec3 pos = ray.origin + ray.dir * t;
+        float localTrap;
+        float d = sdf_evaluate(pos, p, localTrap);
+        // Shell density: peaks at the SDF surface (d=0), falls off both inside and
+        // outside so the interior isn't a uniform opaque blob.
+        // Orbit-trap modulation: lower trap = orbit stayed close = fractal tips/
+        // tendrils = denser cloud, revealing internal structure.
+        float density = __expf(-fabsf(d) * p.vol.densityFalloff)
+                      * __expf(-localTrap * p.vol.trapWeight);
+        s_samples[tid * steps + i] = make_float2(density, localTrap);
+    }
+
+    // Phase 2: front-to-back compositing from SMEM.
+    glm::vec3 accColor = glm::vec3(0.0f);
+    float     accAlpha = 0.0f;
+
+    for (int i = 0; i < steps; ++i) {
+        if (accAlpha >= 0.99f)
+            break;
+
+        float2 s       = s_samples[tid * steps + i];
+        float  density = s.x;
+        float  trap    = s.y;
+
+        if (density < 1e-5f)
+            continue;
+
+        float trapT = p.color.orbitTrap
+                          ? d_clamp(trap * p.color.trapScale, 0.0f, 1.0f)
+                          : 0.5f;
+        glm::vec3 sampleColor =
+            cosPalette(trapT, p.color.paletteA, p.color.paletteB);
+
+        // Beer-Lambert extinction + emission contribution.
+        float alpha = 1.0f - __expf(-density * stepSize * p.vol.absorption);
+        glm::vec3 emitted =
+            sampleColor * (p.vol.emission * density * stepSize);
+
+        accColor += (1.0f - accAlpha) * emitted;
+        accAlpha += (1.0f - accAlpha) * alpha;
+    }
+
+    // Blend remaining transparency with sky background.
+    return accColor + (1.0f - accAlpha) * bg;
+}
+
+// ---------------------------------------------------------------------------
+// Kernels
+// ---------------------------------------------------------------------------
+
+__global__ static void renderKernelSurface(float *pixels, int width, int height,
+                                            RenderParams params) {
     int px = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int py = (int)(blockIdx.y * blockDim.y + threadIdx.y);
     if (px >= width || py >= height)
         return;
 
     glm::vec3 col = shadePixel(px, py, width, height, params);
+
+    int idx = (py * width + px) * 3;
+    pixels[idx + 0] = col.r;
+    pixels[idx + 1] = col.g;
+    pixels[idx + 2] = col.b;
+}
+
+__global__ static void renderKernelVolumetric(float *pixels, int width,
+                                               int height,
+                                               RenderParams params) {
+    extern __shared__ float2 s_volSamples[];
+
+    int px = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int py = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (px >= width || py >= height)
+        return;
+
+    int tid = (int)(threadIdx.y * blockDim.x + threadIdx.x);
+    DevRay ray = makeRay(px, py, width, height, params.camera);
+    glm::vec3 col = marchVolumetric(ray, params, s_volSamples, tid, px, py);
 
     int idx = (py * width + px) * 3;
     pixels[idx + 0] = col.r;
@@ -392,7 +525,19 @@ void GPURenderer::render(int winW, int winH, const RenderParams &params) {
               (m_height + block.y - 1) / block.y);
 
     CUDA_CHECK(cudaEventRecord(evStart));
-    renderKernel<<<grid, block>>>(d_pixels, m_width, m_height, params);
+    if (params.renderMode == RenderMode::Volumetric) {
+        int volSteps = std::min(params.vol.steps, MAX_VOL_STEPS);
+        size_t smem  = (size_t)block.x * block.y * volSteps * sizeof(float2);
+        // Opt in to >48 KB dynamic shared memory on architectures that support it.
+        CUDA_CHECK(cudaFuncSetAttribute(
+            renderKernelVolumetric,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+        renderKernelVolumetric<<<grid, block, smem>>>(d_pixels, m_width,
+                                                       m_height, params);
+    } else {
+        renderKernelSurface<<<grid, block>>>(d_pixels, m_width, m_height,
+                                              params);
+    }
     CUDA_CHECK(cudaEventRecord(evStop));
     CUDA_CHECK(cudaEventSynchronize(evStop));
 

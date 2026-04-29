@@ -312,6 +312,30 @@ static void drawUI() {
     }
 
     ImGui::Spacing();
+    ImGui::SeparatorText("Render Mode");
+    const char *modes[] = {"Surface (ray march)", "Volumetric"};
+    int rm = (int)g.params.renderMode;
+    if (ImGui::Combo("Mode", &rm, modes, 2)) {
+        g.params.renderMode = (RenderMode)rm;
+        changed = true;
+    }
+    if (g.params.renderMode == RenderMode::Volumetric) {
+        auto &v = g.params.vol;
+        if (ImGui::SliderInt("Vol steps", &v.steps, 4, 32))
+            changed = true;
+        if (ImGui::SliderFloat("Density falloff", &v.densityFalloff, 0.5f, 32.0f))
+            changed = true;
+        if (ImGui::SliderFloat("Absorption", &v.absorption, 0.1f, 20.0f))
+            changed = true;
+        if (ImGui::SliderFloat("Emission", &v.emission, 0.0f, 5.0f))
+            changed = true;
+        if (ImGui::SliderFloat("Trap weight", &v.trapWeight, 0.0f, 8.0f))
+            changed = true;
+        if (ImGui::SliderFloat("Bound radius", &v.bound, 0.5f, 8.0f))
+            changed = true;
+    }
+
+    ImGui::Spacing();
     ImGui::SeparatorText("Render Quality");
     if (ImGui::SliderFloat("Resolution", &g.params.renderScale, 0.1f, 1.0f))
         changed = true;

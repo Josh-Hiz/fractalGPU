@@ -22,6 +22,17 @@ struct JuliaParams {
     int iterations = 15;
 };
 
+enum class RenderMode : int { Surface = 0, Volumetric = 1 };
+
+struct VolumetricParams {
+    int steps = 24;              // uniform samples along ray (capped at MAX_VOL_STEPS in GPU)
+    float densityFalloff = 3.0f; // exp(-|d|*falloff): higher = sharper/thinner shell around surface
+    float absorption = 1.2f;     // Beer-Lambert extinction coefficient (lower = more transparent)
+    float emission = 0.2f;       // emission brightness multiplier
+    float trapWeight = 1.5f;     // orbit trap density modulation: lower trap → denser (fractal tips brighter)
+    float bound = 2.0f;          // bounding-sphere radius: samples concentrate inside [tNear, tFar]
+};
+
 struct CameraParams {
     glm::vec3 position = {0.0f, 0.0f, 3.0f};
     glm::vec3 target = {0.0f, 0.0f, 0.0f};
@@ -61,6 +72,8 @@ struct RenderParams {
     CameraParams camera;
     LightParams light;
     ColorParams color;
+    RenderMode renderMode = RenderMode::Surface;
+    VolumetricParams vol;
     int maxSteps = 128;
     float maxDist = 20.0f;
     float epsilon = 0.001f;
