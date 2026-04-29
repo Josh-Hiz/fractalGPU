@@ -1,13 +1,12 @@
 // GPU fractal renderer — CUDA implementation.
 //
-// All SDF, marching, and shading logic is reimplemented here as __device__
-// functions so they run entirely on the GPU.  The public render() call launches
-// a 2-D kernel (one thread per pixel), then copies the HDR float buffer back
-// to host for the existing OpenGL upload path.
+// One thread per pixel. Output goes either directly into a registered GL
+// texture (CUDA-GL interop, zero copies) or into a device buffer that we copy
+// back to host for the caller to upload — picked at registration time.
 
-// The system GLM only knows CUDA up to 8.0.  When GLM_FORCE_CUDA is defined
-// GLM skips including cuda.h, so CUDA_VERSION is never set and its version
-// check fires.  Synthesise it from nvcc's own macros before GLM sees it.
+// System GLM only knows CUDA up to 8.0 and bails on its version check when
+// GLM_FORCE_CUDA hides cuda.h. Synthesise CUDA_VERSION from nvcc's macros
+// before GLM sees it.
 #ifdef __CUDACC__
 #  define CUDA_VERSION (__CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10)
 #endif
@@ -17,22 +16,16 @@
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-// cuda_gl_interop.h needs GL types; pull in glad for declarations only
-// (no GL function symbols are referenced from this TU).
+// cuda_gl_interop.h needs GL types; pull in glad for declarations only.
 #include <glad/glad.h>
 #include <cuda_gl_interop.h>
 #include <surface_indirect_functions.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 
 #include "config.hpp"
 #include "renderer_gpu.hpp"
-
-// ---------------------------------------------------------------------------
-// CUDA error helpers
-// ---------------------------------------------------------------------------
 
 #define CUDA_CHECK(call)                                                       \
     do {                                                                       \
@@ -44,30 +37,26 @@
     } while (0)
 
 // ---------------------------------------------------------------------------
-// GLM device helpers, scalar math replacements for std:: that work on device
+// Device math helpers (std:: replacements that work on device)
 // ---------------------------------------------------------------------------
 
 __device__ static inline float d_clamp(float v, float lo, float hi) {
     return fminf(fmaxf(v, lo), hi);
 }
-
 __device__ static inline glm::vec3 d_clampv(glm::vec3 v, float lo, float hi) {
     return glm::vec3(d_clamp(v.x, lo, hi), d_clamp(v.y, lo, hi),
                      d_clamp(v.z, lo, hi));
 }
-
 __device__ static inline float d_mix(float a, float b, float t) {
     return a + t * (b - a);
 }
-
 __device__ static inline glm::vec3 d_mixv(glm::vec3 a, glm::vec3 b, float t) {
     return glm::vec3(d_mix(a.x, b.x, t), d_mix(a.y, b.y, t),
                      d_mix(a.z, b.z, t));
 }
 
 // ---------------------------------------------------------------------------
-// Device SDF functions
-// (same algorithms as sdf.hpp but using device safe math)
+// SDFs (mirrors of sdf.hpp, using device-safe math).
 // ---------------------------------------------------------------------------
 
 __device__ static float sdf_mandelbulb(glm::vec3 pos, const MandelbulbParams &p,
@@ -115,10 +104,8 @@ __device__ static float sdf_mandelbox(glm::vec3 pos, const MandelboxParams &p,
     const float fixedR2 = p.fixedRadius * p.fixedRadius;
 
     for (int i = 0; i < p.iterations; ++i) {
-        // box fold
         z = d_clampv(z, -p.foldLimit, p.foldLimit) * 2.0f - z;
 
-        // sphere fold
         float r2 = glm::dot(z, z);
         trap = fminf(trap, r2);
 
@@ -186,7 +173,7 @@ __device__ static float sdf_evaluate(const glm::vec3 &pos,
 }
 
 // ---------------------------------------------------------------------------
-// Device ray helpers
+// Ray + shading
 // ---------------------------------------------------------------------------
 
 struct DevRay {
@@ -208,10 +195,6 @@ __device__ static DevRay makeRay(int px, int py, int width, int height,
 
     return {cam.position, glm::normalize(fwd + u * right + v * up)};
 }
-
-// ---------------------------------------------------------------------------
-// Device ray marching + shading
-// ---------------------------------------------------------------------------
 
 // Returns hit distance t, or -1 on miss.
 __device__ static float march(const DevRay &ray, const RenderParams &p,
@@ -237,7 +220,6 @@ __device__ static float march(const DevRay &ray, const RenderParams &p,
     return -1.0f;
 }
 
-// Central difference numerical gradient of the SDF.
 __device__ static glm::vec3 calcNormal(const glm::vec3 &pos,
                                         const RenderParams &p) {
     float e = p.epsilon * 2.0f;
@@ -251,7 +233,6 @@ __device__ static glm::vec3 calcNormal(const glm::vec3 &pos,
             sdf_evaluate(pos - glm::vec3(0, 0, e), p, dummy)));
 }
 
-// Penumbra soft shadow.
 __device__ static float softShadow(const glm::vec3 &pos, const glm::vec3 &ldir,
                                     const RenderParams &p) {
     if (!p.light.softShadows) {
@@ -274,7 +255,6 @@ __device__ static float softShadow(const glm::vec3 &pos, const glm::vec3 &ldir,
     return d_clamp(res, 0.0f, 1.0f);
 }
 
-// Step based ambient occlusion along the surface normal.
 __device__ static float ambientOcc(const glm::vec3 &pos, const glm::vec3 &nor,
                                     const RenderParams &p) {
     if (!p.light.aoEnabled)
@@ -298,7 +278,6 @@ __device__ static glm::vec3 cosPalette(float t, const glm::vec3 &a,
     return d_mixv(b, a, f);
 }
 
-// Background: vertical gradient + glow.
 __device__ static glm::vec3 background(const glm::vec3 &dir, float minD,
                                         const RenderParams &p) {
     float fade = 0.5f * (dir.y + 1.0f);
@@ -308,7 +287,6 @@ __device__ static glm::vec3 background(const glm::vec3 &dir, float minD,
     return bg;
 }
 
-// Full per pixel shading.
 __device__ static glm::vec3 shadePixel(int px, int py, int width, int height,
                                         const RenderParams &p) {
     DevRay ray = makeRay(px, py, width, height, p.camera);
@@ -335,35 +313,25 @@ __device__ static glm::vec3 shadePixel(int px, int py, int width, int height,
                       : 0.5f;
     glm::vec3 surfCol = cosPalette(trapT, p.color.paletteA, p.color.paletteB);
 
-    glm::vec3 ambientCol = p.light.ambient * surfCol * ao;
-    glm::vec3 diffuseCol = p.light.diffuse * diff * shadow * p.light.color * surfCol;
-    glm::vec3 specularCol = p.light.specular * spec * shadow * p.light.color;
+    glm::vec3 col = p.light.ambient * surfCol * ao
+                  + p.light.diffuse * diff * shadow * p.light.color * surfCol
+                  + p.light.specular * spec * shadow * p.light.color;
 
-    glm::vec3 col = ambientCol + diffuseCol + specularCol;
-
-    // subtle distance fog
-    col = d_mixv(p.color.bgTop, col, __expf(-t * 0.04f));
-
-    return col;
+    return d_mixv(p.color.bgTop, col, __expf(-t * 0.04f));
 }
 
 // ---------------------------------------------------------------------------
-// Volumetric ray marcher
+// Volumetric ray marcher.
 //
-// Samples the SDF uniformly along the ray, stores (density, trap) per sample
-// in shared memory, then composites front-to-back using Beer-Lambert.  Each
-// thread owns its own SMEM slice (no cross-thread sync needed) - the SMEM
-// keeps register pressure low and decouples the sample/composite phases.
-//
-// Samples are concentrated inside the fractal's bounding sphere (so the same
-// step budget gets ~5x finer resolution on the structure) and a per-pixel
-// jitter dithers the sampling pattern to hide the slab boundaries that would
-// otherwise alias as "phasing" edges when the camera rotates.
+// Two-phase: sample density+trap into per-thread SMEM, then composite
+// front-to-back (Beer-Lambert + emission). Samples are confined to the
+// fractal's bounding sphere for resolution, jittered per-pixel to dither
+// slab boundaries that would otherwise alias as edge phasing on rotation.
 // ---------------------------------------------------------------------------
 
 #define MAX_VOL_STEPS 32
 
-// Ray vs sphere centered at origin.  Returns false on miss.
+// Ray vs origin-centered sphere.
 __device__ static bool intersectSphere(const DevRay &ray, float radius,
                                         float &tNear, float &tFar) {
     float b = glm::dot(ray.origin, ray.dir);
@@ -377,13 +345,10 @@ __device__ static bool intersectSphere(const DevRay &ray, float radius,
     return true;
 }
 
-// Stable per-pixel hash in [0, 1) — used to jitter the sample offset.
 __device__ static float pixelHash(int px, int py) {
     unsigned int h = ((unsigned int)px * 73856093u) ^ ((unsigned int)py * 19349663u);
-    h ^= h >> 16;
-    h *= 0x85ebca6bu;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35u;
+    h ^= h >> 16; h *= 0x85ebca6bu;
+    h ^= h >> 13; h *= 0xc2b2ae35u;
     h ^= h >> 16;
     return (float)(h & 0xFFFFFFu) / (float)0x1000000u;
 }
@@ -394,11 +359,9 @@ __device__ static glm::vec3 marchVolumetric(const DevRay &ray,
                                              int px, int py) {
     const int steps = min(p.vol.steps, MAX_VOL_STEPS);
 
-    // Sky background — used both on miss and as the residual transmittance fill.
     float fade = 0.5f * (ray.dir.y + 1.0f);
     glm::vec3 bg = d_mixv(p.color.bgBottom, p.color.bgTop, fade);
 
-    // Concentrate samples inside the fractal's bounding sphere.
     float tNear, tFar;
     if (!intersectSphere(ray, p.vol.bound, tNear, tFar))
         return bg;
@@ -410,32 +373,30 @@ __device__ static glm::vec3 marchVolumetric(const DevRay &ray,
     const float stepSize = (tFar - tNear) / (float)steps;
     const float jitter   = pixelHash(px, py);
 
-    // Phase 1: sample SDF along ray, write (density, trap) into SMEM.
+    // Sample.
     for (int i = 0; i < steps; ++i) {
         float t = tNear + ((float)i + jitter) * stepSize;
         glm::vec3 pos = ray.origin + ray.dir * t;
         float localTrap;
         float d = sdf_evaluate(pos, p, localTrap);
-        // Shell density: peaks at the SDF surface (d=0), falls off both inside and
-        // outside so the interior isn't a uniform opaque blob.
-        // Orbit-trap modulation: lower trap = orbit stayed close = fractal tips/
-        // tendrils = denser cloud, revealing internal structure.
+        // Shell density (peaks at d=0) modulated by orbit trap (low trap →
+        // dense fractal tips/tendrils).
         float density = __expf(-fabsf(d) * p.vol.densityFalloff)
                       * __expf(-localTrap * p.vol.trapWeight);
         s_samples[tid * steps + i] = make_float2(density, localTrap);
     }
 
-    // Phase 2: front-to-back compositing from SMEM.
-    glm::vec3 accColor = glm::vec3(0.0f);
+    // Composite front-to-back.
+    glm::vec3 accColor(0.0f);
     float     accAlpha = 0.0f;
 
     for (int i = 0; i < steps; ++i) {
         if (accAlpha >= 0.99f)
             break;
 
-        float2 s       = s_samples[tid * steps + i];
-        float  density = s.x;
-        float  trap    = s.y;
+        float2 s = s_samples[tid * steps + i];
+        float density = s.x;
+        float trap    = s.y;
 
         if (density < 1e-5f)
             continue;
@@ -446,7 +407,6 @@ __device__ static glm::vec3 marchVolumetric(const DevRay &ray,
         glm::vec3 sampleColor =
             cosPalette(trapT, p.color.paletteA, p.color.paletteB);
 
-        // Beer-Lambert extinction + emission contribution.
         float alpha = 1.0f - __expf(-density * stepSize * p.vol.absorption);
         glm::vec3 emitted =
             sampleColor * (p.vol.emission * density * stepSize);
@@ -455,78 +415,75 @@ __device__ static glm::vec3 marchVolumetric(const DevRay &ray,
         accAlpha += (1.0f - accAlpha) * alpha;
     }
 
-    // Blend remaining transparency with sky background.
     return accColor + (1.0f - accAlpha) * bg;
 }
 
 // ---------------------------------------------------------------------------
-// Kernels
+// Output adapters — let one templated kernel write to either a CUDA surface
+// (interop fast path) or a linear device buffer (host-upload fallback).
 // ---------------------------------------------------------------------------
 
-__global__ static void renderKernelSurface(cudaSurfaceObject_t surf, int width,
-                                            int height, RenderParams params) {
-    int px = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int py = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+struct SurfaceOut {
+    cudaSurfaceObject_t surf;
+    __device__ void write(int x, int y, float4 v) const {
+        surf2Dwrite(v, surf, x * (int)sizeof(float4), y);
+    }
+};
+
+struct BufferOut {
+    float4 *buf;
+    int width;
+    __device__ void write(int x, int y, float4 v) const {
+        buf[y * width + x] = v;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Kernels (templated on the output adapter)
+// ---------------------------------------------------------------------------
+
+template <class Out>
+__global__ static void kernelSurface(Out out, int width, int height,
+                                      RenderParams params) {
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
     if (px >= width || py >= height)
         return;
-
     glm::vec3 col = shadePixel(px, py, width, height, params);
-    float4 pix = make_float4(col.r, col.g, col.b, 1.0f);
-    surf2Dwrite(pix, surf, px * (int)sizeof(float4), py);
+    out.write(px, py, make_float4(col.r, col.g, col.b, 1.0f));
 }
 
-__global__ static void renderKernelVolumetric(cudaSurfaceObject_t surf,
-                                               int width, int height,
-                                               RenderParams params) {
+template <class Out>
+__global__ static void kernelVolumetric(Out out, int width, int height,
+                                         RenderParams params) {
     extern __shared__ float2 s_volSamples[];
-
-    int px = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int py = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
     if (px >= width || py >= height)
         return;
-
-    int tid = (int)(threadIdx.y * blockDim.x + threadIdx.x);
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
     DevRay ray = makeRay(px, py, width, height, params.camera);
     glm::vec3 col = marchVolumetric(ray, params, s_volSamples, tid, px, py);
-
-    float4 pix = make_float4(col.r, col.g, col.b, 1.0f);
-    surf2Dwrite(pix, surf, px * (int)sizeof(float4), py);
+    out.write(px, py, make_float4(col.r, col.g, col.b, 1.0f));
 }
 
-// Buffer variants: used by the host-upload fallback when CUDA-GL interop is
-// unavailable (hybrid-graphics laptops, etc). Same shading; just write to a
-// linear float4 device buffer instead of a surface.
-__global__ static void renderKernelSurface_Buf(float4 *out, int width,
-                                                int height,
-                                                RenderParams params) {
-    int px = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int py = (int)(blockIdx.y * blockDim.y + threadIdx.y);
-    if (px >= width || py >= height)
-        return;
-
-    glm::vec3 col = shadePixel(px, py, width, height, params);
-    out[py * width + px] = make_float4(col.r, col.g, col.b, 1.0f);
-}
-
-__global__ static void renderKernelVolumetric_Buf(float4 *out, int width,
-                                                   int height,
-                                                   RenderParams params) {
-    extern __shared__ float2 s_volSamples[];
-
-    int px = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int py = (int)(blockIdx.y * blockDim.y + threadIdx.y);
-    if (px >= width || py >= height)
-        return;
-
-    int tid = (int)(threadIdx.y * blockDim.x + threadIdx.x);
-    DevRay ray = makeRay(px, py, width, height, params.camera);
-    glm::vec3 col = marchVolumetric(ray, params, s_volSamples, tid, px, py);
-
-    out[py * width + px] = make_float4(col.r, col.g, col.b, 1.0f);
+template <class Out>
+static void launchRender(Out out, int width, int height, dim3 grid, dim3 block,
+                          const RenderParams &p) {
+    if (p.renderMode == RenderMode::Volumetric) {
+        int volSteps = std::min(p.vol.steps, MAX_VOL_STEPS);
+        size_t smem  = (size_t)block.x * block.y * volSteps * sizeof(float2);
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kernelVolumetric<Out>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+        kernelVolumetric<Out><<<grid, block, smem>>>(out, width, height, p);
+    } else {
+        kernelSurface<Out><<<grid, block>>>(out, width, height, p);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// GPURenderer implementation
+// GPURenderer
 // ---------------------------------------------------------------------------
 
 GPURenderer::~GPURenderer() {
@@ -549,17 +506,15 @@ void GPURenderer::setOutputTexture(unsigned int glTex, int w, int h) {
     if (!glTex)
         return;
 
-    // Try to bind the CUDA device that owns the GL context. On hybrid-graphics
-    // systems where GL runs on the iGPU, this lets us discover up-front that
-    // interop won't work and skip straight to the fallback.
+    // Bind the CUDA device that owns the GL context (matters on multi-GPU
+    // NVIDIA setups). On hybrid graphics where GL is on a non-NVIDIA device
+    // this returns no devices and the registration below will fail cleanly.
     unsigned int devCount = 0;
     int devs[8] = {0};
-    cudaError_t qerr = cudaGLGetDevices(&devCount, devs, 8,
-                                         cudaGLDeviceListAll);
-    if (qerr == cudaSuccess && devCount > 0) {
+    if (cudaGLGetDevices(&devCount, devs, 8, cudaGLDeviceListAll) ==
+            cudaSuccess && devCount > 0) {
         cudaSetDevice(devs[0]);
     } else {
-        // Clear the error state so the next CUDA call doesn't trip on it.
         (void)cudaGetLastError();
     }
 
@@ -571,25 +526,18 @@ void GPURenderer::setOutputTexture(unsigned int glTex, int w, int h) {
         m_useInterop = true;
     } else {
         m_glRes = nullptr;
-        // Eat the error so the next CUDA_CHECK doesn't see it.
         (void)cudaGetLastError();
         fprintf(stderr,
-                "[GPURenderer] CUDA-GL interop unavailable (%s); falling "
-                "back to host upload.\n"
-                "  Cause: GL context isn't on the NVIDIA device (hybrid "
-                "graphics, or display driven by an iGPU).\n"
-                "  Fix on Wayland: rerun with X11 + NVIDIA GLX, e.g.\n"
-                "    FRACTAL_FORCE_X11=1 __NV_PRIME_RENDER_OFFLOAD=1 "
-                "__GLX_VENDOR_LIBRARY_NAME=nvidia ./FractalGPU\n"
-                "  Fix on X11: just prefix __NV_PRIME_RENDER_OFFLOAD=1 "
-                "__GLX_VENDOR_LIBRARY_NAME=nvidia.\n",
+                "[GPURenderer] CUDA-GL interop unavailable (%s); "
+                "using host-upload fallback.\n"
+                "  Try: FRACTAL_FORCE_X11=1 __NV_PRIME_RENDER_OFFLOAD=1 "
+                "__GLX_VENDOR_LIBRARY_NAME=nvidia\n",
                 cudaGetErrorString(err));
     }
 
-    // Size the fallback storage to match. We always allocate it: cheap, and
-    // means we can switch modes at any time if the user reattaches a
-    // different texture later.
-    size_t needBytes = (size_t)w * (size_t)h * sizeof(float) * 4;
+    // Fallback storage. Always allocated so we can switch modes if a
+    // different texture is reattached later.
+    size_t needBytes = (size_t)w * (size_t)h * sizeof(float4);
     if (needBytes != m_dPixelsBytes) {
         if (m_dPixels) {
             CUDA_CHECK(cudaFree(m_dPixels));
@@ -602,12 +550,11 @@ void GPURenderer::setOutputTexture(unsigned int glTex, int w, int h) {
     m_pixels.resize((size_t)w * (size_t)h * 4);
 }
 
-void GPURenderer::render(int winW, int winH, const RenderParams &params) {
-    // Caller is expected to keep the registered texture sized to match
-    // (winW * renderScale, winH * renderScale) — main.cpp does this.
+void GPURenderer::render(int /*winW*/, int /*winH*/, const RenderParams &params) {
+    // Render dimensions come from the registered texture (caller keeps the
+    // texture sized to winW*scale × winH*scale).
     if (m_width <= 0 || m_height <= 0)
         return;
-    (void)winW; (void)winH; // dimensions come from the registered texture
 
     cudaEvent_t evStart, evStop;
     CUDA_CHECK(cudaEventCreate(&evStart));
@@ -617,61 +564,41 @@ void GPURenderer::render(int winW, int winH, const RenderParams &params) {
     dim3 grid((m_width + block.x - 1) / block.x,
               (m_height + block.y - 1) / block.y);
 
+    CUDA_CHECK(cudaEventRecord(evStart));
+
     if (m_useInterop && m_glRes) {
-        // Fast path: kernel writes directly into the GL texture's memory.
+        // Fast path: kernel writes straight into the GL texture.
         CUDA_CHECK(cudaGraphicsMapResources(1, &m_glRes, 0));
         cudaArray_t arr = nullptr;
         CUDA_CHECK(cudaGraphicsSubResourceGetMappedArray(&arr, m_glRes, 0, 0));
 
-        cudaResourceDesc resDesc{};
-        resDesc.resType = cudaResourceTypeArray;
-        resDesc.res.array.array = arr;
+        cudaResourceDesc rd{};
+        rd.resType = cudaResourceTypeArray;
+        rd.res.array.array = arr;
         cudaSurfaceObject_t surf = 0;
-        CUDA_CHECK(cudaCreateSurfaceObject(&surf, &resDesc));
+        CUDA_CHECK(cudaCreateSurfaceObject(&surf, &rd));
 
-        CUDA_CHECK(cudaEventRecord(evStart));
-        if (params.renderMode == RenderMode::Volumetric) {
-            int volSteps = std::min(params.vol.steps, MAX_VOL_STEPS);
-            size_t smem  = (size_t)block.x * block.y * volSteps * sizeof(float2);
-            CUDA_CHECK(cudaFuncSetAttribute(
-                renderKernelVolumetric,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
-            renderKernelVolumetric<<<grid, block, smem>>>(surf, m_width,
-                                                           m_height, params);
-        } else {
-            renderKernelSurface<<<grid, block>>>(surf, m_width, m_height,
-                                                  params);
-        }
+        launchRender(SurfaceOut{surf}, m_width, m_height, grid, block, params);
+
         CUDA_CHECK(cudaEventRecord(evStop));
         CUDA_CHECK(cudaEventSynchronize(evStop));
 
         CUDA_CHECK(cudaDestroySurfaceObject(surf));
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &m_glRes, 0));
-    } else {
-        // Fallback path: kernel writes to a device buffer; we copy back to a
-        // host vector and let the caller upload via glTexSubImage2D.
-        if (!m_dPixels)
-            return;
-        float4 *dOut = static_cast<float4 *>(m_dPixels);
+    } else if (m_dPixels) {
+        // Fallback: kernel → device buffer → host vector → caller uploads.
+        launchRender(BufferOut{static_cast<float4 *>(m_dPixels), m_width},
+                     m_width, m_height, grid, block, params);
 
-        CUDA_CHECK(cudaEventRecord(evStart));
-        if (params.renderMode == RenderMode::Volumetric) {
-            int volSteps = std::min(params.vol.steps, MAX_VOL_STEPS);
-            size_t smem  = (size_t)block.x * block.y * volSteps * sizeof(float2);
-            CUDA_CHECK(cudaFuncSetAttribute(
-                renderKernelVolumetric_Buf,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
-            renderKernelVolumetric_Buf<<<grid, block, smem>>>(
-                dOut, m_width, m_height, params);
-        } else {
-            renderKernelSurface_Buf<<<grid, block>>>(dOut, m_width, m_height,
-                                                      params);
-        }
         CUDA_CHECK(cudaEventRecord(evStop));
         CUDA_CHECK(cudaEventSynchronize(evStop));
 
         CUDA_CHECK(cudaMemcpy(m_pixels.data(), m_dPixels, m_dPixelsBytes,
                               cudaMemcpyDeviceToHost));
+    } else {
+        CUDA_CHECK(cudaEventDestroy(evStart));
+        CUDA_CHECK(cudaEventDestroy(evStop));
+        return;
     }
 
     float ms = 0.0f;
