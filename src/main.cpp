@@ -422,6 +422,8 @@ static void drawUI() {
             changed = true;
         if (ImGui::SliderFloat("Bound radius", &v.bound, 0.5f, 8.0f))
             changed = true;
+        if (ImGui::Checkbox("Use shared mem (smem two-pass)", &v.useSharedMem))
+            changed = true;
     }
 
     ImGui::Spacing();

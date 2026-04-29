@@ -31,6 +31,13 @@ struct VolumetricParams {
     float emission = 0.2f;       // emission brightness multiplier
     float trapWeight = 1.5f;     // orbit trap density modulation: lower trap → denser (fractal tips brighter)
     float bound = 2.0f;          // bounding-sphere radius: samples concentrate inside [tNear, tFar]
+    // Volumetric kernel selection on GPU:
+    //   true  → two-pass kernel that stores samples in dynamic SMEM, then
+    //           composites. Caps active blocks/SM (smem-bound).
+    //   false → single-pass fused kernel (no SMEM); composites in the sample
+    //           loop with early-out when alpha saturates.
+    // The CPU renderer doesn't implement volumetric, so this is GPU-only.
+    bool useSharedMem = true;
 };
 
 struct CameraParams {

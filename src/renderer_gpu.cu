@@ -418,6 +418,67 @@ __device__ static glm::vec3 marchVolumetric(const DevRay &ray,
     return accColor + (1.0f - accAlpha) * bg;
 }
 
+// Fused (no-SMEM) variant of the volumetric raymarcher.
+//
+// Sample + composite in one loop, with early-out when alpha saturates.
+// Trades the SMEM-cached sampling pass for redundant register pressure but
+// avoids the smem-bound occupancy cap, AND skips remaining SDF evaluations
+// after alpha saturates — should win on dense scenes.
+//
+// No `s_samples` parameter, no shared memory, no MAX_VOL_STEPS cap on smem.
+__device__ static glm::vec3 marchVolumetricFused(const DevRay &ray,
+                                                  const RenderParams &p,
+                                                  int px, int py) {
+    const int steps = min(p.vol.steps, MAX_VOL_STEPS);
+
+    float fade = 0.5f * (ray.dir.y + 1.0f);
+    glm::vec3 bg = d_mixv(p.color.bgBottom, p.color.bgTop, fade);
+
+    float tNear, tFar;
+    if (!intersectSphere(ray, p.vol.bound, tNear, tFar))
+        return bg;
+    tNear = fmaxf(tNear, 0.001f);
+    tFar  = fminf(tFar, p.maxDist);
+    if (tFar <= tNear)
+        return bg;
+
+    const float stepSize = (tFar - tNear) / (float)steps;
+    const float jitter   = pixelHash(px, py);
+
+    glm::vec3 accColor(0.0f);
+    float     accAlpha = 0.0f;
+
+    for (int i = 0; i < steps; ++i) {
+        if (accAlpha >= 0.99f)
+            break; // early-out skips remaining SDF evaluations
+
+        float t = tNear + ((float)i + jitter) * stepSize;
+        glm::vec3 pos = ray.origin + ray.dir * t;
+        float localTrap;
+        float d = sdf_evaluate(pos, p, localTrap);
+        float density = __expf(-fabsf(d) * p.vol.densityFalloff)
+                      * __expf(-localTrap * p.vol.trapWeight);
+
+        if (density < 1e-5f)
+            continue;
+
+        float trapT = p.color.orbitTrap
+                          ? d_clamp(localTrap * p.color.trapScale, 0.0f, 1.0f)
+                          : 0.5f;
+        glm::vec3 sampleColor =
+            cosPalette(trapT, p.color.paletteA, p.color.paletteB);
+
+        float alpha = 1.0f - __expf(-density * stepSize * p.vol.absorption);
+        glm::vec3 emitted =
+            sampleColor * (p.vol.emission * density * stepSize);
+
+        accColor += (1.0f - accAlpha) * emitted;
+        accAlpha += (1.0f - accAlpha) * alpha;
+    }
+
+    return accColor + (1.0f - accAlpha) * bg;
+}
+
 // ---------------------------------------------------------------------------
 // Output adapters — let one templated kernel write to either a CUDA surface
 // (interop fast path) or a linear device buffer (host-upload fallback).
@@ -468,15 +529,32 @@ __global__ static void kernelVolumetric(Out out, int width, int height,
 }
 
 template <class Out>
+__global__ static void kernelVolumetricFused(Out out, int width, int height,
+                                              RenderParams params) {
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
+    if (px >= width || py >= height)
+        return;
+    DevRay ray = makeRay(px, py, width, height, params.camera);
+    glm::vec3 col = marchVolumetricFused(ray, params, px, py);
+    out.write(px, py, make_float4(col.r, col.g, col.b, 1.0f));
+}
+
+template <class Out>
 static void launchRender(Out out, int width, int height, dim3 grid, dim3 block,
                           const RenderParams &p) {
     if (p.renderMode == RenderMode::Volumetric) {
-        int volSteps = std::min(p.vol.steps, MAX_VOL_STEPS);
-        size_t smem  = (size_t)block.x * block.y * volSteps * sizeof(float2);
-        CUDA_CHECK(cudaFuncSetAttribute(
-            kernelVolumetric<Out>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
-        kernelVolumetric<Out><<<grid, block, smem>>>(out, width, height, p);
+        if (p.vol.useSharedMem) {
+            int volSteps = std::min(p.vol.steps, MAX_VOL_STEPS);
+            size_t smem =
+                (size_t)block.x * block.y * volSteps * sizeof(float2);
+            CUDA_CHECK(cudaFuncSetAttribute(
+                kernelVolumetric<Out>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+            kernelVolumetric<Out><<<grid, block, smem>>>(out, width, height, p);
+        } else {
+            kernelVolumetricFused<Out><<<grid, block>>>(out, width, height, p);
+        }
     } else {
         kernelSurface<Out><<<grid, block>>>(out, width, height, p);
     }
@@ -607,4 +685,94 @@ void GPURenderer::render(int /*winW*/, int /*winH*/, const RenderParams &params)
 
     CUDA_CHECK(cudaEventDestroy(evStart));
     CUDA_CHECK(cudaEventDestroy(evStop));
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics: device props + per-kernel attributes & theoretical occupancy.
+// Lives here because the templated `static` kernels have internal linkage.
+// ---------------------------------------------------------------------------
+void gpu_print_diagnostics(int blockX, int blockY, int volSteps) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        fprintf(stderr, "cudaGetDevice failed\n");
+        return;
+    }
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+        fprintf(stderr, "cudaGetDeviceProperties failed\n");
+        return;
+    }
+
+    printf("\n=== CUDA device ===\n");
+    printf("  %s  (CC %d.%d)\n", prop.name, prop.major, prop.minor);
+    printf("  SMs: %d   max threads/SM: %d   warp: %d\n",
+           prop.multiProcessorCount, prop.maxThreadsPerMultiProcessor,
+           prop.warpSize);
+    printf("  Regs/SM: %d   smem/SM: %zu B   smem/block: %zu B\n",
+           prop.regsPerMultiprocessor,
+           (size_t)prop.sharedMemPerMultiprocessor,
+           (size_t)prop.sharedMemPerBlock);
+    // CUDA 13 dropped memoryClockRate/memoryBusWidth from cudaDeviceProp;
+    // query via the attribute API which is stable across versions.
+    int memClkKHz = 0, busWidth = 0;
+    cudaDeviceGetAttribute(&memClkKHz, cudaDevAttrMemoryClockRate, dev);
+    cudaDeviceGetAttribute(&busWidth, cudaDevAttrGlobalMemoryBusWidth, dev);
+    double peakBW =
+        2.0 * (double)memClkKHz * (double)busWidth / 8.0 / 1.0e6;
+    printf("  Mem clock: %.0f MHz   bus: %d-bit   peak BW: %.1f GB/s\n",
+           memClkKHz / 1000.0, busWidth, peakBW);
+
+    int blockThreads = blockX * blockY;
+
+    auto report = [&](const char *name, const void *func, size_t dynSmem) {
+        cudaFuncAttributes a{};
+        cudaError_t err = cudaFuncGetAttributes(&a, func);
+        if (err != cudaSuccess) {
+            printf("  %s: cudaFuncGetAttributes failed (%s)\n", name,
+                   cudaGetErrorString(err));
+            return;
+        }
+        int activeBlocks = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &activeBlocks, func, blockThreads, dynSmem);
+        double occ = (double)(activeBlocks * blockThreads) /
+                     (double)prop.maxThreadsPerMultiProcessor;
+        int suggBlock = 0, suggMinGrid = 0;
+        cudaOccupancyMaxPotentialBlockSize(&suggMinGrid, &suggBlock, func,
+                                            dynSmem, 0);
+        printf("  %s\n", name);
+        printf("    regs/thread=%d  static_smem=%zu B  dyn_smem=%zu B  "
+               "max_threads/block=%d\n",
+               a.numRegs, (size_t)a.sharedSizeBytes, dynSmem,
+               a.maxThreadsPerBlock);
+        printf("    @ block %dx%d=%d  ->  active_blocks/SM=%d  "
+               "theoretical occupancy=%.1f%%\n",
+               blockX, blockY, blockThreads, activeBlocks, occ * 100.0);
+        printf("    occupancy-optimal block size (smem-aware): %d threads "
+               "(min grid for full util: %d blocks)\n",
+               suggBlock, suggMinGrid);
+    };
+
+    // Allow large dyn smem for the volumetric kernel before querying.
+    cudaFuncSetAttribute(kernelVolumetric<BufferOut>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+
+    size_t volSmem = (size_t)blockThreads * (size_t)volSteps * sizeof(float2);
+
+    printf("\n=== Kernel attributes (BufferOut variants) ===\n");
+    report("kernelSurface<BufferOut>",
+           (const void *)kernelSurface<BufferOut>, 0);
+    report("kernelVolumetric<BufferOut> [smem two-pass]",
+           (const void *)kernelVolumetric<BufferOut>, volSmem);
+    report("kernelVolumetricFused<BufferOut> [no smem, single-pass]",
+           (const void *)kernelVolumetricFused<BufferOut>, 0);
+
+    printf("\nFor achieved occupancy, mem throughput, branch divergence, "
+           "instruction mix, run:\n"
+           "  ncu --set full --target-processes all "
+           "--kernel-name-base demangled "
+           "--kernel-regex 'kernel(Surface|Volumetric)' "
+           "./FractalGPUBench --frames 1 --warmup 0\n"
+           "Or full timeline with:\n"
+           "  nsys profile -o bench.nsys-rep ./FractalGPUBench --frames 20\n\n");
 }

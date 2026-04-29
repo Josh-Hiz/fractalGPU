@@ -84,3 +84,52 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
         $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native>
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# Benchmark frontend (headless, no ImGui). Uses a hidden GLFW window so the
+# GPU path can register a real GL texture for CUDA-GL interop.
+# ---------------------------------------------------------------------------
+set(BENCH_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/bench.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/renderer_cpu.cpp
+)
+if(FRACTAL_ENABLE_CUDA)
+    list(APPEND BENCH_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/renderer_gpu.cu)
+endif()
+
+add_executable(FractalGPUBench ${BENCH_SOURCES})
+
+target_include_directories(FractalGPUBench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/glad/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# imgui static lib is reused only because it carries glad.c — saves duplicating
+# it. We don't pull any imgui headers into bench.cpp.
+target_link_libraries(FractalGPUBench PRIVATE
+    OpenGL::GL
+    glfw
+    imgui
+    ${CMAKE_DL_LIBS}
+)
+
+if(FRACTAL_ENABLE_CUDA)
+    target_compile_definitions(FractalGPUBench PRIVATE FRACTAL_USE_CUDA)
+    target_link_libraries(FractalGPUBench PRIVATE CUDA::cudart)
+    set_target_properties(FractalGPUBench PROPERTIES
+        CUDA_ARCHITECTURES native
+    )
+    target_compile_options(FractalGPUBench PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -O3>
+    )
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(FractalGPUBench PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wextra>
+    )
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(FractalGPUBench PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native>
+    )
+endif()

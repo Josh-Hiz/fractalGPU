@@ -55,3 +55,8 @@ class GPURenderer {
     size_t m_dPixelsBytes = 0;
     std::vector<float> m_pixels;     // host mirror, RGBA32F, length w*h*4
 };
+
+// Print device properties, kernel attributes (regs/thread, smem), and
+// theoretical occupancy for the bench harness. Implemented in renderer_gpu.cu
+// because the kernels have internal linkage there.
+void gpu_print_diagnostics(int blockX, int blockY, int volSteps);
