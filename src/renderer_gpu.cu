@@ -17,11 +17,15 @@
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+// cuda_gl_interop.h needs GL types; pull in glad for declarations only
+// (no GL function symbols are referenced from this TU).
+#include <glad/glad.h>
+#include <cuda_gl_interop.h>
+#include <surface_indirect_functions.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <vector>
 
 #include "config.hpp"
 #include "renderer_gpu.hpp"
@@ -459,23 +463,20 @@ __device__ static glm::vec3 marchVolumetric(const DevRay &ray,
 // Kernels
 // ---------------------------------------------------------------------------
 
-__global__ static void renderKernelSurface(float *pixels, int width, int height,
-                                            RenderParams params) {
+__global__ static void renderKernelSurface(cudaSurfaceObject_t surf, int width,
+                                            int height, RenderParams params) {
     int px = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int py = (int)(blockIdx.y * blockDim.y + threadIdx.y);
     if (px >= width || py >= height)
         return;
 
     glm::vec3 col = shadePixel(px, py, width, height, params);
-
-    int idx = (py * width + px) * 3;
-    pixels[idx + 0] = col.r;
-    pixels[idx + 1] = col.g;
-    pixels[idx + 2] = col.b;
+    float4 pix = make_float4(col.r, col.g, col.b, 1.0f);
+    surf2Dwrite(pix, surf, px * (int)sizeof(float4), py);
 }
 
-__global__ static void renderKernelVolumetric(float *pixels, int width,
-                                               int height,
+__global__ static void renderKernelVolumetric(cudaSurfaceObject_t surf,
+                                               int width, int height,
                                                RenderParams params) {
     extern __shared__ float2 s_volSamples[];
 
@@ -488,10 +489,40 @@ __global__ static void renderKernelVolumetric(float *pixels, int width,
     DevRay ray = makeRay(px, py, width, height, params.camera);
     glm::vec3 col = marchVolumetric(ray, params, s_volSamples, tid, px, py);
 
-    int idx = (py * width + px) * 3;
-    pixels[idx + 0] = col.r;
-    pixels[idx + 1] = col.g;
-    pixels[idx + 2] = col.b;
+    float4 pix = make_float4(col.r, col.g, col.b, 1.0f);
+    surf2Dwrite(pix, surf, px * (int)sizeof(float4), py);
+}
+
+// Buffer variants: used by the host-upload fallback when CUDA-GL interop is
+// unavailable (hybrid-graphics laptops, etc). Same shading; just write to a
+// linear float4 device buffer instead of a surface.
+__global__ static void renderKernelSurface_Buf(float4 *out, int width,
+                                                int height,
+                                                RenderParams params) {
+    int px = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int py = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (px >= width || py >= height)
+        return;
+
+    glm::vec3 col = shadePixel(px, py, width, height, params);
+    out[py * width + px] = make_float4(col.r, col.g, col.b, 1.0f);
+}
+
+__global__ static void renderKernelVolumetric_Buf(float4 *out, int width,
+                                                   int height,
+                                                   RenderParams params) {
+    extern __shared__ float2 s_volSamples[];
+
+    int px = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int py = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (px >= width || py >= height)
+        return;
+
+    int tid = (int)(threadIdx.y * blockDim.x + threadIdx.x);
+    DevRay ray = makeRay(px, py, width, height, params.camera);
+    glm::vec3 col = marchVolumetric(ray, params, s_volSamples, tid, px, py);
+
+    out[py * width + px] = make_float4(col.r, col.g, col.b, 1.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,23 +530,85 @@ __global__ static void renderKernelVolumetric(float *pixels, int width,
 // ---------------------------------------------------------------------------
 
 GPURenderer::~GPURenderer() {
-    if (d_pixels)
-        CUDA_CHECK(cudaFree(d_pixels));
+    if (m_glRes)
+        CUDA_CHECK(cudaGraphicsUnregisterResource(m_glRes));
+    if (m_dPixels)
+        CUDA_CHECK(cudaFree(m_dPixels));
+}
+
+void GPURenderer::setOutputTexture(unsigned int glTex, int w, int h) {
+    if (m_glRes) {
+        CUDA_CHECK(cudaGraphicsUnregisterResource(m_glRes));
+        m_glRes = nullptr;
+    }
+    m_glTex = glTex;
+    m_width = w;
+    m_height = h;
+    m_useInterop = false;
+
+    if (!glTex)
+        return;
+
+    // Try to bind the CUDA device that owns the GL context. On hybrid-graphics
+    // systems where GL runs on the iGPU, this lets us discover up-front that
+    // interop won't work and skip straight to the fallback.
+    unsigned int devCount = 0;
+    int devs[8] = {0};
+    cudaError_t qerr = cudaGLGetDevices(&devCount, devs, 8,
+                                         cudaGLDeviceListAll);
+    if (qerr == cudaSuccess && devCount > 0) {
+        cudaSetDevice(devs[0]);
+    } else {
+        // Clear the error state so the next CUDA call doesn't trip on it.
+        (void)cudaGetLastError();
+    }
+
+    cudaError_t err = cudaGraphicsGLRegisterImage(
+        &m_glRes, glTex, GL_TEXTURE_2D,
+        cudaGraphicsRegisterFlagsSurfaceLoadStore);
+
+    if (err == cudaSuccess) {
+        m_useInterop = true;
+    } else {
+        m_glRes = nullptr;
+        // Eat the error so the next CUDA_CHECK doesn't see it.
+        (void)cudaGetLastError();
+        fprintf(stderr,
+                "[GPURenderer] CUDA-GL interop unavailable (%s); falling "
+                "back to host upload.\n"
+                "  Cause: GL context isn't on the NVIDIA device (hybrid "
+                "graphics, or display driven by an iGPU).\n"
+                "  Fix on Wayland: rerun with X11 + NVIDIA GLX, e.g.\n"
+                "    FRACTAL_FORCE_X11=1 __NV_PRIME_RENDER_OFFLOAD=1 "
+                "__GLX_VENDOR_LIBRARY_NAME=nvidia ./FractalGPU\n"
+                "  Fix on X11: just prefix __NV_PRIME_RENDER_OFFLOAD=1 "
+                "__GLX_VENDOR_LIBRARY_NAME=nvidia.\n",
+                cudaGetErrorString(err));
+    }
+
+    // Size the fallback storage to match. We always allocate it: cheap, and
+    // means we can switch modes at any time if the user reattaches a
+    // different texture later.
+    size_t needBytes = (size_t)w * (size_t)h * sizeof(float) * 4;
+    if (needBytes != m_dPixelsBytes) {
+        if (m_dPixels) {
+            CUDA_CHECK(cudaFree(m_dPixels));
+            m_dPixels = nullptr;
+        }
+        if (needBytes > 0)
+            CUDA_CHECK(cudaMalloc(&m_dPixels, needBytes));
+        m_dPixelsBytes = needBytes;
+    }
+    m_pixels.resize((size_t)w * (size_t)h * 4);
 }
 
 void GPURenderer::render(int winW, int winH, const RenderParams &params) {
-    m_width = glm::max(1, (int)(winW * params.renderScale));
-    m_height = glm::max(1, (int)(winH * params.renderScale));
+    // Caller is expected to keep the registered texture sized to match
+    // (winW * renderScale, winH * renderScale) — main.cpp does this.
+    if (m_width <= 0 || m_height <= 0)
+        return;
+    (void)winW; (void)winH; // dimensions come from the registered texture
 
-    size_t needed = (size_t)m_width * m_height * 3 * sizeof(float);
-    if (needed > d_pixels_bytes) {
-        if (d_pixels)
-            CUDA_CHECK(cudaFree(d_pixels));
-        CUDA_CHECK(cudaMalloc(&d_pixels, needed));
-        d_pixels_bytes = needed;
-    }
-
-    // CUDA events for accurate GPU timing
     cudaEvent_t evStart, evStop;
     CUDA_CHECK(cudaEventCreate(&evStart));
     CUDA_CHECK(cudaEventCreate(&evStop));
@@ -524,22 +617,62 @@ void GPURenderer::render(int winW, int winH, const RenderParams &params) {
     dim3 grid((m_width + block.x - 1) / block.x,
               (m_height + block.y - 1) / block.y);
 
-    CUDA_CHECK(cudaEventRecord(evStart));
-    if (params.renderMode == RenderMode::Volumetric) {
-        int volSteps = std::min(params.vol.steps, MAX_VOL_STEPS);
-        size_t smem  = (size_t)block.x * block.y * volSteps * sizeof(float2);
-        // Opt in to >48 KB dynamic shared memory on architectures that support it.
-        CUDA_CHECK(cudaFuncSetAttribute(
-            renderKernelVolumetric,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
-        renderKernelVolumetric<<<grid, block, smem>>>(d_pixels, m_width,
-                                                       m_height, params);
+    if (m_useInterop && m_glRes) {
+        // Fast path: kernel writes directly into the GL texture's memory.
+        CUDA_CHECK(cudaGraphicsMapResources(1, &m_glRes, 0));
+        cudaArray_t arr = nullptr;
+        CUDA_CHECK(cudaGraphicsSubResourceGetMappedArray(&arr, m_glRes, 0, 0));
+
+        cudaResourceDesc resDesc{};
+        resDesc.resType = cudaResourceTypeArray;
+        resDesc.res.array.array = arr;
+        cudaSurfaceObject_t surf = 0;
+        CUDA_CHECK(cudaCreateSurfaceObject(&surf, &resDesc));
+
+        CUDA_CHECK(cudaEventRecord(evStart));
+        if (params.renderMode == RenderMode::Volumetric) {
+            int volSteps = std::min(params.vol.steps, MAX_VOL_STEPS);
+            size_t smem  = (size_t)block.x * block.y * volSteps * sizeof(float2);
+            CUDA_CHECK(cudaFuncSetAttribute(
+                renderKernelVolumetric,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+            renderKernelVolumetric<<<grid, block, smem>>>(surf, m_width,
+                                                           m_height, params);
+        } else {
+            renderKernelSurface<<<grid, block>>>(surf, m_width, m_height,
+                                                  params);
+        }
+        CUDA_CHECK(cudaEventRecord(evStop));
+        CUDA_CHECK(cudaEventSynchronize(evStop));
+
+        CUDA_CHECK(cudaDestroySurfaceObject(surf));
+        CUDA_CHECK(cudaGraphicsUnmapResources(1, &m_glRes, 0));
     } else {
-        renderKernelSurface<<<grid, block>>>(d_pixels, m_width, m_height,
-                                              params);
+        // Fallback path: kernel writes to a device buffer; we copy back to a
+        // host vector and let the caller upload via glTexSubImage2D.
+        if (!m_dPixels)
+            return;
+        float4 *dOut = static_cast<float4 *>(m_dPixels);
+
+        CUDA_CHECK(cudaEventRecord(evStart));
+        if (params.renderMode == RenderMode::Volumetric) {
+            int volSteps = std::min(params.vol.steps, MAX_VOL_STEPS);
+            size_t smem  = (size_t)block.x * block.y * volSteps * sizeof(float2);
+            CUDA_CHECK(cudaFuncSetAttribute(
+                renderKernelVolumetric_Buf,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+            renderKernelVolumetric_Buf<<<grid, block, smem>>>(
+                dOut, m_width, m_height, params);
+        } else {
+            renderKernelSurface_Buf<<<grid, block>>>(dOut, m_width, m_height,
+                                                      params);
+        }
+        CUDA_CHECK(cudaEventRecord(evStop));
+        CUDA_CHECK(cudaEventSynchronize(evStop));
+
+        CUDA_CHECK(cudaMemcpy(m_pixels.data(), m_dPixels, m_dPixelsBytes,
+                              cudaMemcpyDeviceToHost));
     }
-    CUDA_CHECK(cudaEventRecord(evStop));
-    CUDA_CHECK(cudaEventSynchronize(evStop));
 
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, evStart, evStop));
@@ -547,8 +680,4 @@ void GPURenderer::render(int winW, int winH, const RenderParams &params) {
 
     CUDA_CHECK(cudaEventDestroy(evStart));
     CUDA_CHECK(cudaEventDestroy(evStop));
-
-    m_pixels.resize(m_width * m_height * 3);
-    CUDA_CHECK(cudaMemcpy(m_pixels.data(), d_pixels, needed,
-                          cudaMemcpyDeviceToHost));
 }

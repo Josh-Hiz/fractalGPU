@@ -9,9 +9,14 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
+#include <vector>
 
 class Recorder {
   public:
@@ -69,41 +74,71 @@ class Recorder {
 
         m_start = std::chrono::steady_clock::now();
         m_nextFrame = m_start;
+        // Spawn the background writer so fwrite() to the (potentially slow)
+        // ffmpeg pipe never blocks the main render/UI loop.
+        m_stopWriter = false;
+        m_writer = std::thread([this] { writerLoop(); });
         return true;
     }
 
-    // Write `rgb` (width*height*3 bytes, bottom-up from glReadPixels) to the
-    // pipe as many times as needed to match wall-clock pacing at target FPS.
-    void pump(const unsigned char *rgb) {
+    // True when wall-clock has reached the next-frame slot. Use this to gate
+    // animation / readback so each call to pump() writes exactly one fresh
+    // frame, never a duplicate.
+    bool dueForFrame() const {
+        if (!m_pipe)
+            return false;
+        return std::chrono::steady_clock::now() >= m_nextFrame;
+    }
+
+    // Write one frame. Caller is expected to gate on dueForFrame() and supply
+    // a freshly-rendered image — duplicates would create freeze-and-jump
+    // artifacts in the video.
+    //
+    // Hot path: copy `rgb` into a queued buffer and return. The background
+    // writer thread does the actual fwrite(). Bounded queue + cv backpressure
+    // prevents memory blowup if ffmpeg can't keep up; in the common case the
+    // queue is empty when we push.
+    void writeFrame(const unsigned char *rgb) {
         if (!m_pipe)
             return;
+        size_t bytes = (size_t)m_w * (size_t)m_h * 3;
+        std::vector<unsigned char> buf(rgb, rgb + bytes);
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            m_cvSpace.wait(lk, [&] {
+                return m_queue.size() < kQueueCap || m_stopWriter;
+            });
+            if (m_stopWriter)
+                return;
+            m_queue.push(std::move(buf));
+        }
+        m_cvWork.notify_one();
+
+        m_frames++;
         using namespace std::chrono;
-        auto now = steady_clock::now();
         auto frameDur = duration_cast<steady_clock::duration>(
             duration<double>(1.0 / (double)m_fps));
-
-        size_t bytes = (size_t)m_w * (size_t)m_h * 3;
-        // Cap duplicates per call so a long stall (e.g. user dragged the
-        // window) doesn't dump thousands of identical frames at once.
-        int writes = 0;
-        while (now >= m_nextFrame && writes < 16) {
-            if (std::fwrite(rgb, 1, bytes, m_pipe) != bytes) {
-                m_err = "pipe write failed";
-                stop();
-                return;
-            }
-            m_frames++;
-            m_nextFrame += frameDur;
-            writes++;
-        }
-        // If we hit the cap, snap forward so we don't carry a huge backlog.
-        if (writes >= 16 && now > m_nextFrame)
+        m_nextFrame += frameDur;
+        // If we've fallen far behind wall-clock (rendering stall), snap the
+        // schedule forward to "now" so we don't try to catch up by writing a
+        // burst of frames — that would just compress motion into a blur.
+        auto now = steady_clock::now();
+        if (now > m_nextFrame + frameDur)
             m_nextFrame = now;
     }
 
     void stop() {
         if (!m_pipe)
             return;
+        // Signal writer to drain the queue and exit, then close the pipe.
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_stopWriter = true;
+        }
+        m_cvWork.notify_all();
+        m_cvSpace.notify_all();
+        if (m_writer.joinable())
+            m_writer.join();
         pclose(m_pipe);
         m_pipe = nullptr;
     }
@@ -123,6 +158,34 @@ class Recorder {
     const std::string &error() const { return m_err; }
 
   private:
+    // Background writer: drains queued buffers into the ffmpeg pipe so the
+    // main thread is never blocked by a slow encoder.
+    void writerLoop() {
+        for (;;) {
+            std::vector<unsigned char> buf;
+            {
+                std::unique_lock<std::mutex> lk(m_mtx);
+                m_cvWork.wait(lk,
+                              [&] { return !m_queue.empty() || m_stopWriter; });
+                if (m_queue.empty() && m_stopWriter)
+                    return;
+                buf = std::move(m_queue.front());
+                m_queue.pop();
+            }
+            // Tell the producer there's space, then do the (potentially slow)
+            // pipe write outside the mutex.
+            m_cvSpace.notify_one();
+            if (!m_pipe)
+                return;
+            if (std::fwrite(buf.data(), 1, buf.size(), m_pipe) != buf.size()) {
+                m_err = "pipe write failed";
+                return;
+            }
+        }
+    }
+
+    static constexpr size_t kQueueCap = 8;
+
     FILE *m_pipe = nullptr;
     int m_w = 0, m_h = 0;
     int m_fps = 30;
@@ -131,4 +194,11 @@ class Recorder {
     std::string m_err;
     std::chrono::steady_clock::time_point m_start;
     std::chrono::steady_clock::time_point m_nextFrame;
+
+    std::thread m_writer;
+    std::mutex m_mtx;
+    std::condition_variable m_cvWork;  // signals queued frames to writer
+    std::condition_variable m_cvSpace; // signals queue space to producer
+    std::queue<std::vector<unsigned char>> m_queue;
+    bool m_stopWriter = false;
 };
