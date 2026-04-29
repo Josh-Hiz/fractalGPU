@@ -12,8 +12,11 @@
 #include <iostream>
 
 #include "config.hpp"
+#include "recorder.hpp"
 #include "renderer_cpu.hpp"
 #include "shaders.hpp"
+#include <ctime>
+#include <vector>
 #ifdef FRACTAL_USE_CUDA
 #include "renderer_gpu.hpp"
 #endif
@@ -80,6 +83,15 @@ struct App {
     bool dragging = false;
     double lastMX = 0.0;
     double lastMY = 0.0;
+
+    // Recording. drawUI() flips the request flags; the main loop services
+    // them so the recorder dimensions reflect the current framebuffer size.
+    Recorder recorder;
+    int recFps = 30;
+    int recQuality = (int)Recorder::Quality::Medium;
+    bool recRequestStart = false;
+    bool recRequestStop = false;
+    std::string recMessage;
 };
 
 static App g;
@@ -437,6 +449,33 @@ static void drawUI() {
     ImGui::Spacing();
 #endif
 
+    // Recording.
+    ImGui::SeparatorText("Recording");
+    if (g.recorder.isActive()) {
+        // Visual cue: red-tinted button while recording.
+        ImGui::PushStyleColor(ImGuiCol_Button,        {0.62f, 0.16f, 0.20f, 1.0f});
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.78f, 0.22f, 0.26f, 1.0f});
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  {0.92f, 0.30f, 0.34f, 1.0f});
+        // Stable label/ID — putting live stats in the label changes the
+        // ImGui ID every frame and breaks press/release click detection.
+        if (ImGui::Button("Stop recording", {-1.0f, 30.0f}))
+            g.recRequestStop = true;
+        ImGui::PopStyleColor(3);
+        ImGui::TextDisabled("%.1fs  %d frames  %dx%d @ %d fps",
+                            g.recorder.elapsedSec(), g.recorder.frames(),
+                            g.recorder.width(), g.recorder.height(),
+                            g.recorder.fps());
+    } else {
+        const char *qNames[] = {"Low", "Medium", "High", "Very High"};
+        ImGui::Combo("Quality", &g.recQuality, qNames, 4);
+        ImGui::SliderInt("FPS", &g.recFps, 15, 60);
+        if (ImGui::Button("Record", {-1.0f, 30.0f}))
+            g.recRequestStart = true;
+    }
+    if (!g.recMessage.empty())
+        ImGui::TextDisabled("%s", g.recMessage.c_str());
+    ImGui::Spacing();
+
     // render button + stats
     if (ImGui::Button("Render now", {-1.0f, 30.0f}))
         g.dirty = true;
@@ -579,6 +618,19 @@ int main() {
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glBindVertexArray(0);
 
+        // Capture for recording: read back the fractal scene before ImGui
+        // overlays the UI. Bottom-up; the recorder hands ffmpeg a vflip.
+        if (g.recorder.isActive()) {
+            static std::vector<unsigned char> readback;
+            int rw = g.recorder.width();
+            int rh = g.recorder.height();
+            readback.resize((size_t)rw * (size_t)rh * 3);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, rw, rh, GL_RGB, GL_UNSIGNED_BYTE,
+                         readback.data());
+            g.recorder.pump(readback.data());
+        }
+
         // ImGui on top
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -587,8 +639,35 @@ int main() {
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
+        // Service recording start/stop requested from drawUI() this frame.
+        if (g.recRequestStart) {
+            g.recRequestStart = false;
+            std::time_t t = std::time(nullptr);
+            std::tm tm_ = *std::localtime(&t);
+            char fname[128];
+            std::strftime(fname, sizeof(fname),
+                          "fractal_%Y%m%d_%H%M%S.mp4", &tm_);
+            if (g.recorder.start(winW, winH, g.recFps,
+                                  (Recorder::Quality)g.recQuality, fname))
+                g.recMessage = std::string("Recording -> ") + fname;
+            else
+                g.recMessage = std::string("Failed: ") + g.recorder.error();
+        }
+        if (g.recRequestStop) {
+            g.recRequestStop = false;
+            int frames = g.recorder.frames();
+            std::string p = g.recorder.path();
+            g.recorder.stop();
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Saved %s (%d frames)", p.c_str(),
+                     frames);
+            g.recMessage = msg;
+        }
+
         glfwSwapBuffers(win);
     }
+    // Make sure the pipe is closed if the user quit mid-recording.
+    g.recorder.stop();
 
     glDeleteTextures(1, &g.tex);
     glDeleteBuffers(1, &vbo);
