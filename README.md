@@ -108,3 +108,9 @@ Here are the results of our CPU ray-marcher, real-time statistics and performanc
 ### Julia Set Quaternion Render
 
 ![bulb](./assets/cpu_julia.png)
+
+## Presentation
+
+A presentation of our full results can be [found here](/Presentation/Presentation.pdf)
+
+Our final report will be released soon.
