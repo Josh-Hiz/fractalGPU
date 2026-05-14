@@ -3,6 +3,7 @@
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -12,8 +13,11 @@
 #include <iostream>
 
 #include "config.hpp"
+#include "recorder.hpp"
 #include "renderer_cpu.hpp"
 #include "shaders.hpp"
+#include <ctime>
+#include <vector>
 #ifdef FRACTAL_USE_CUDA
 #include "renderer_gpu.hpp"
 #endif
@@ -76,13 +80,98 @@ struct App {
     bool useGPU = false;
 #endif
     GLuint tex = 0;
+    int texW = 0;
+    int texH = 0;
     bool dirty = true;
     bool dragging = false;
     double lastMX = 0.0;
     double lastMY = 0.0;
+
+    // Recording. drawUI() flips the request flags; the main loop services
+    // them so recorder dimensions reflect the current framebuffer size.
+    Recorder recorder;
+    int recFps = 30;
+    int recQuality = (int)Recorder::Quality::Medium;
+    bool recRequestStart = false;
+    bool recRequestStop = false;
+    std::string recMessage;
+
+    // Auto camera animation: spins azimuth, optionally sways elevation.
+    bool autoRotate = false;
+    float autoSpinDeg = 30.0f;     // azimuth deg/sec
+    float autoElevAmp = 0.0f;      // elevation sway amplitude (radians)
+    float autoElevPeriod = 8.0f;   // sway period (seconds)
+    float autoElevBase = 0.3f;     // baseline elevation, captured on toggle
+    double autoTime = 0.0;         // accumulated animation time
+
+    std::chrono::steady_clock::time_point lastFrameTime;
+    bool haveLastFrameTime = false;
 };
 
 static App g;
+
+// Stats from whichever renderer is active.
+struct RenderStats { double ms; int w; int h; };
+static RenderStats currentStats() {
+#ifdef FRACTAL_USE_CUDA
+    if (g.useGPU)
+        return {g.gpuRenderer.renderMs(), g.gpuRenderer.renderWidth(),
+                g.gpuRenderer.renderHeight()};
+#endif
+    return {g.cpuRenderer.renderMs(), g.cpuRenderer.renderWidth(),
+            g.cpuRenderer.renderHeight()};
+}
+
+// Generate a timestamped output filename: fractal_YYYYMMDD_HHMMSS.mp4.
+static std::string timestampedFilename() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm_ = *std::localtime(&t);
+    char buf[128];
+    std::strftime(buf, sizeof(buf), "fractal_%Y%m%d_%H%M%S.mp4", &tm_);
+    return buf;
+}
+
+static void serviceRecording(int winW, int winH) {
+    if (g.recRequestStart) {
+        g.recRequestStart = false;
+        std::string fname = timestampedFilename();
+        if (g.recorder.start(winW, winH, g.recFps,
+                             (Recorder::Quality)g.recQuality, fname))
+            g.recMessage = "Recording -> " + fname;
+        else
+            g.recMessage = "Failed: " + g.recorder.error();
+    }
+    if (g.recRequestStop) {
+        g.recRequestStop = false;
+        int frames = g.recorder.frames();
+        std::string p = g.recorder.path();
+        g.recorder.stop();
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Saved %s (%d frames)", p.c_str(), frames);
+        g.recMessage = msg;
+    }
+}
+
+// Advance the auto-rotate camera by `dt` seconds. Returns true if anything
+// changed (so the caller can flag the frame as dirty).
+static bool advanceAutoRotate(double dt) {
+    if (!g.autoRotate || dt <= 0.0)
+        return false;
+    g.autoTime += dt;
+    constexpr float kPi = 3.14159265f;
+    constexpr float kTwoPi = 6.2831853f;
+    g.orbit.azimuth += (g.autoSpinDeg * kPi / 180.0f) * (float)dt;
+    if (g.orbit.azimuth >  kPi) g.orbit.azimuth -= kTwoPi;
+    if (g.orbit.azimuth < -kPi) g.orbit.azimuth += kTwoPi;
+    if (g.autoElevAmp > 0.001f) {
+        float w = kTwoPi / std::max(g.autoElevPeriod, 0.1f);
+        g.orbit.elevation =
+            g.autoElevBase + g.autoElevAmp * std::sin(w * (float)g.autoTime);
+        g.orbit.elevation = std::clamp(g.orbit.elevation, -1.4f, 1.4f);
+    }
+    g.orbit.apply(g.params);
+    return true;
+}
 
 // GLFW callbacks
 static void onMouseBtn(GLFWwindow *win, int btn, int action, int) {
@@ -312,6 +401,32 @@ static void drawUI() {
     }
 
     ImGui::Spacing();
+    ImGui::SeparatorText("Render Mode");
+    const char *modes[] = {"Surface (ray march)", "Volumetric"};
+    int rm = (int)g.params.renderMode;
+    if (ImGui::Combo("Mode", &rm, modes, 2)) {
+        g.params.renderMode = (RenderMode)rm;
+        changed = true;
+    }
+    if (g.params.renderMode == RenderMode::Volumetric) {
+        auto &v = g.params.vol;
+        if (ImGui::SliderInt("Vol steps", &v.steps, 4, 32))
+            changed = true;
+        if (ImGui::SliderFloat("Density falloff", &v.densityFalloff, 0.5f, 32.0f))
+            changed = true;
+        if (ImGui::SliderFloat("Absorption", &v.absorption, 0.1f, 20.0f))
+            changed = true;
+        if (ImGui::SliderFloat("Emission", &v.emission, 0.0f, 5.0f))
+            changed = true;
+        if (ImGui::SliderFloat("Trap weight", &v.trapWeight, 0.0f, 8.0f))
+            changed = true;
+        if (ImGui::SliderFloat("Bound radius", &v.bound, 0.5f, 8.0f))
+            changed = true;
+        if (ImGui::Checkbox("Use shared mem (smem two-pass)", &v.useSharedMem))
+            changed = true;
+    }
+
+    ImGui::Spacing();
     ImGui::SeparatorText("Render Quality");
     if (ImGui::SliderFloat("Resolution", &g.params.renderScale, 0.1f, 1.0f))
         changed = true;
@@ -413,34 +528,62 @@ static void drawUI() {
     ImGui::Spacing();
 #endif
 
+    // Auto camera animation — designed to feed clean, time-paced motion
+    // into the recorder so videos don't look like manual drag jitter.
+    ImGui::SeparatorText("Animation");
+    if (ImGui::Checkbox("Auto rotate", &g.autoRotate)) {
+        if (g.autoRotate) {
+            // Snapshot user's elevation as the sway baseline and reset
+            // phase so the sin term starts at zero (no jump).
+            g.autoElevBase = g.orbit.elevation;
+            g.autoTime = 0.0;
+        }
+    }
+    if (g.autoRotate) {
+        ImGui::SliderFloat("Spin speed", &g.autoSpinDeg, -180.0f, 180.0f,
+                           "%.0f deg/s");
+        ImGui::SliderFloat("Elev sway", &g.autoElevAmp, 0.0f, 0.8f);
+        if (g.autoElevAmp > 0.001f)
+            ImGui::SliderFloat("Sway period", &g.autoElevPeriod, 1.0f, 30.0f,
+                               "%.1f s");
+    }
+    ImGui::Spacing();
+
+    // Recording.
+    ImGui::SeparatorText("Recording");
+    if (g.recorder.isActive()) {
+        // Visual cue: red-tinted button while recording.
+        ImGui::PushStyleColor(ImGuiCol_Button,        {0.62f, 0.16f, 0.20f, 1.0f});
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.78f, 0.22f, 0.26f, 1.0f});
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  {0.92f, 0.30f, 0.34f, 1.0f});
+        // Stable label/ID — putting live stats in the label changes the
+        // ImGui ID every frame and breaks press/release click detection.
+        if (ImGui::Button("Stop recording", {-1.0f, 30.0f}))
+            g.recRequestStop = true;
+        ImGui::PopStyleColor(3);
+        ImGui::TextDisabled("%.1fs  %d frames  %dx%d @ %d fps",
+                            g.recorder.elapsedSec(), g.recorder.frames(),
+                            g.recorder.width(), g.recorder.height(),
+                            g.recorder.fps());
+    } else {
+        const char *qNames[] = {"Low", "Medium", "High", "Very High"};
+        ImGui::Combo("Quality", &g.recQuality, qNames, 4);
+        ImGui::SliderInt("FPS", &g.recFps, 15, 60);
+        if (ImGui::Button("Record", {-1.0f, 30.0f}))
+            g.recRequestStart = true;
+    }
+    if (!g.recMessage.empty())
+        ImGui::TextDisabled("%s", g.recMessage.c_str());
+    ImGui::Spacing();
+
     // render button + stats
     if (ImGui::Button("Render now", {-1.0f, 30.0f}))
         g.dirty = true;
 
     ImGui::Spacing();
-    double ms = g.useGPU
-#ifdef FRACTAL_USE_CUDA
-                    ? g.gpuRenderer.renderMs()
-#else
-                    ? 0.0
-#endif
-                    : g.cpuRenderer.renderMs();
-    int rw = g.useGPU
-#ifdef FRACTAL_USE_CUDA
-                 ? g.gpuRenderer.renderWidth()
-#else
-                 ? 0
-#endif
-                 : g.cpuRenderer.renderWidth();
-    int rh = g.useGPU
-#ifdef FRACTAL_USE_CUDA
-                 ? g.gpuRenderer.renderHeight()
-#else
-                 ? 0
-#endif
-                 : g.cpuRenderer.renderHeight();
-    ImGui::TextDisabled("Render time : %.1f ms", ms);
-    ImGui::TextDisabled("Resolution  : %d x %d", rw, rh);
+    RenderStats rs = currentStats();
+    ImGui::TextDisabled("Render time : %.1f ms", rs.ms);
+    ImGui::TextDisabled("Resolution  : %d x %d", rs.w, rs.h);
     ImGui::TextDisabled("Left-drag: orbit   Scroll: zoom");
 
     ImGui::End();
@@ -451,6 +594,13 @@ static void drawUI() {
 
 //  main
 int main() {
+    // FRACTAL_FORCE_X11=1 routes GLFW through X11/XWayland so the
+    // __NV_PRIME_RENDER_OFFLOAD / __GLX_VENDOR_LIBRARY_NAME envs can put the
+    // GL context on NVIDIA — needed for CUDA-GL interop on Wayland with
+    // hybrid graphics (display on iGPU, CUDA on dGPU).
+    if (const char *f = std::getenv("FRACTAL_FORCE_X11"); f && *f && *f != '0')
+        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
+
     if (!glfwInit()) {
         std::cerr << "GLFW init failed\n";
         return -1;
@@ -505,13 +655,35 @@ int main() {
     glEnableVertexAttribArray(1);
     glBindVertexArray(0);
 
-    // HDR texture for CPU render output
+    // HDR target texture. RGBA32F because CUDA surfaces don't support
+    // 3-channel float formats. CPU path uploads via glTexSubImage2D; GPU path
+    // either writes directly (interop) or uploads its host mirror (fallback).
     glGenTextures(1, &g.tex);
     glBindTexture(GL_TEXTURE_2D, g.tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // Resize the texture on demand. The CUDA resource must be unregistered
+    // BEFORE glTexImage2D (which frees the old backing storage) and
+    // re-registered after — otherwise the next cudaGraphicsMapResources hits
+    // a dangling pointer.
+    auto ensureTexture = [](int w, int h) {
+        if (w == g.texW && h == g.texH)
+            return;
+#ifdef FRACTAL_USE_CUDA
+        g.gpuRenderer.setOutputTexture(0, 0, 0);
+#endif
+        glBindTexture(GL_TEXTURE_2D, g.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT,
+                     nullptr);
+        g.texW = w;
+        g.texH = h;
+#ifdef FRACTAL_USE_CUDA
+        g.gpuRenderer.setOutputTexture(g.tex, w, h);
+#endif
+    };
 
     g.orbit.apply(g.params);
 
@@ -522,25 +694,53 @@ int main() {
         glfwGetFramebufferSize(win, &winW, &winH);
         glViewport(0, 0, winW, winH);
 
-        // Render → upload to texture
+        // Wall-clock dt, clamped against pathological stalls (window drag etc).
+        auto nowT = std::chrono::steady_clock::now();
+        double dt = g.haveLastFrameTime
+            ? std::chrono::duration<double>(nowT - g.lastFrameTime).count()
+            : 0.0;
+        g.lastFrameTime = nowT;
+        g.haveLastFrameTime = true;
+        if (dt > 0.25) dt = 0.25;
+
+        // While recording, pace animation off the video clock so each captured
+        // frame represents exactly 1/fps of motion — eliminates the freeze-
+        // then-jump artifact that wall-clock dt produces on stalls.
+        bool willCapture = g.recorder.isActive() && g.recorder.dueForFrame();
+        double animDt = g.recorder.isActive()
+            ? (willCapture ? 1.0 / (double)g.recorder.fps() : 0.0)
+            : dt;
+
+        if (advanceAutoRotate(animDt))
+            g.dirty = true;
+
+        // Render → texture. Interop path writes directly into the GL texture;
+        // fallback (host upload) and CPU path go through glTexSubImage2D.
         if (g.dirty) {
+            int rw = std::max(1, (int)(winW * g.params.renderScale));
+            int rh = std::max(1, (int)(winH * g.params.renderScale));
+            ensureTexture(rw, rh);
 #ifdef FRACTAL_USE_CUDA
             if (g.useGPU) {
                 g.gpuRenderer.render(winW, winH, g.params);
-                glBindTexture(GL_TEXTURE_2D, g.tex);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
-                             g.gpuRenderer.renderWidth(),
-                             g.gpuRenderer.renderHeight(), 0, GL_RGB, GL_FLOAT,
-                             g.gpuRenderer.pixels().data());
+                if (g.gpuRenderer.needsHostUpload()) {
+                    glBindTexture(GL_TEXTURE_2D, g.tex);
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                                    g.gpuRenderer.renderWidth(),
+                                    g.gpuRenderer.renderHeight(),
+                                    GL_RGBA, GL_FLOAT,
+                                    g.gpuRenderer.pixels().data());
+                }
             } else
 #endif
             {
                 g.cpuRenderer.render(winW, winH, g.params);
                 glBindTexture(GL_TEXTURE_2D, g.tex);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
-                             g.cpuRenderer.renderWidth(),
-                             g.cpuRenderer.renderHeight(), 0, GL_RGB, GL_FLOAT,
-                             g.cpuRenderer.pixels().data());
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                                g.cpuRenderer.renderWidth(),
+                                g.cpuRenderer.renderHeight(),
+                                GL_RGB, GL_FLOAT,
+                                g.cpuRenderer.pixels().data());
             }
             g.dirty = false;
         }
@@ -555,6 +755,19 @@ int main() {
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glBindVertexArray(0);
 
+        // Capture before ImGui overlays the UI. Gated by willCapture so the
+        // glReadPixels + pipe write only happens at the recording's cadence.
+        if (willCapture) {
+            static std::vector<unsigned char> readback;
+            int rw = g.recorder.width();
+            int rh = g.recorder.height();
+            readback.resize((size_t)rw * (size_t)rh * 3);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, rw, rh, GL_RGB, GL_UNSIGNED_BYTE,
+                         readback.data());
+            g.recorder.writeFrame(readback.data());
+        }
+
         // ImGui on top
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -563,8 +776,11 @@ int main() {
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
+        serviceRecording(winW, winH);
+
         glfwSwapBuffers(win);
     }
+    g.recorder.stop(); // closes the ffmpeg pipe if a recording was active
 
     glDeleteTextures(1, &g.tex);
     glDeleteBuffers(1, &vbo);
